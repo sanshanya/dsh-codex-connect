@@ -8,7 +8,7 @@ import type { Context, Fiber } from '@deepseek-ai/cordis'
 import { randomUUID } from 'node:crypto'
 import { dirname, join } from 'node:path'
 import z from '@deepseek-ai/schemastery'
-import { deepEqualJson, installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
+import { deepEqualJson } from '@deepseek-ai/dsh-util-values'
 import type {} from '@deepseek-ai/dsh-attachment'
 import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-session'
@@ -16,12 +16,14 @@ import type {} from '@deepseek-ai/dsh-web'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type {} from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-fs'
-import { createOpenAICodexAdapter, openAICodexModelCatalog } from './adapter.ts'
-import { registerOpenAICodexAuthRoutes } from './auth-routes.ts'
+import type {} from '@deepseek-ai/dsh-user-approval'
+import { assertOpenAICodexContextWindowOverrides, createOpenAICodexAdapter, openAICodexModelCatalog } from './adapter.ts'
+import { OPENAI_CODEX_AUTHORIZATION_TIMEOUT_MS, registerOpenAICodexAuthRoutes } from './auth-routes.ts'
 import { registerOpenAICodexProxyRoutes } from './proxy-routes.ts'
 import { OPENAI_CODEX_TRUSTED_ORIGINS_FILENAME, OpenAICodexTrustedOriginsStore } from './trusted-origins.ts'
 import { registerOpenAICodexUpdateRoutes } from './update-routes.ts'
 import { registerOpenAICodexModelCatalogRoute } from './model-routes.ts'
+import { registerOpenAICodexOriginalImageRoute } from './image-asset-routes.ts'
 import {
   checkForOpenAICodexUpdate,
   compareOpenAICodexVersions,
@@ -36,6 +38,9 @@ import { viewImageTool } from './view-image.ts'
 import { OpenAICodexTransport } from './transport.ts'
 import type { OpenAICodexTransportV1 } from './transport.ts'
 import { OpenAICodexProxyManager } from './provider-proxy.ts'
+import { OpenAICodexImageAssetStore } from './image-assets.ts'
+import { registerOpenAICodexAutoReview } from './auto-review.ts'
+import { selectOpenAICodexSearchRoute } from './search-route-override.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -65,7 +70,7 @@ export {
   PI_AI_PACKAGE,
   SUPPORTED_DSH_PLUGIN_API_VERSION,
   SUPPORTED_NODE_RANGE,
-  SUPPORTED_PI_AI_VERSION,
+  SUPPORTED_PI_AI_RANGE,
   evaluateCompatibility,
 } from './compatibility.ts'
 export type {
@@ -99,12 +104,14 @@ import {
   isValidOpenAICodexProxyUrl,
   resolveOpenAICodexProxyUrl,
   resolveOpenAICodexSettings,
+  parseOpenAICodexContextWindowOverrides,
 } from './settings-contract.ts'
 
 export {
   decodeOpenAICodexSettings,
   DEFAULT_OPENAI_CODEX_PROXY_URL,
   DEFAULT_OPENAI_CODEX_SETTINGS,
+  isValidOpenAICodexContextWindowOverrides,
   isValidOpenAICodexProxyUrl,
   OPENAI_CODEX_SETTINGS_NAMESPACE,
   resolveOpenAICodexProxyUrl,
@@ -173,10 +180,14 @@ export {
 export type { OpenAICodexUpdateResult } from './update.ts'
 export {
   OpenAICodexCredentialStore,
+  OPENAI_CODEX_ACCOUNT_LIMIT,
+  OPENAI_CODEX_AUTH_DOCUMENT_LIMIT,
   OPENAI_CODEX_AUTH_FILENAME,
+  OPENAI_CODEX_AUTH_V1_BACKUP_SUFFIX,
   OPENAI_CODEX_PROVIDER,
   openAICodexAuthPath,
 } from './store.ts'
+export type { OpenAICodexAccountSummary } from './store.ts'
 export {
   DEFAULT_OPENAI_CODEX_SEARCH_CONTEXT_SIZE,
   DEFAULT_OPENAI_CODEX_SEARCH_MAX_OUTPUT_TOKENS,
@@ -212,22 +223,36 @@ export const name = 'llm-openai-codex'
 export const inject = ['llm']
 
 /** Branded Host settings namespace for Codex Connect capability configuration. */
-export const OPENAI_CODEX_SETTINGS_NS = settingsNamespace(OPENAI_CODEX_SETTINGS_NAMESPACE)
+export const OPENAI_CODEX_SETTINGS_NS = OPENAI_CODEX_SETTINGS_NAMESPACE
 
 /** Composite model and standalone-search configuration. */
 export interface Config {
+  /** Complete interactive OAuth deadline in milliseconds; applies when the plugin loads. */
+  oauthTimeoutMs?: number
   /** Model ids advertised in selectors; omitted to advertise the full catalog. */
   models?: string[] | undefined
   /** Route Codex Connect requests through proxyUrl after explicit activation. */
   enableProxy?: boolean
   /** Credential-free HTTP(S) proxy origin. */
   proxyUrl?: string
+  /**
+   * Per-model context-window overrides keyed by catalog model id. Each value
+   * replaces the advertised `contextWindow` for that model inside the adapter
+   * profile for client budgeting. It does not change or verify server capacity,
+   * output-token limits, or the deployment's compaction policy.
+   * Whole-map or per-model null disables inherited overrides; omitted keys inherit lower layers.
+   */
+  contextWindowOverrides?: Record<string, number | null> | null | undefined
   /** Register the optional standalone Codex search provider. */
   enableSearch?: boolean
   /** Register the optional image-loading tool. */
   enableImageTool?: boolean
   /** Register the optional prompt-only image generation tool. */
   enableImageGeneration?: boolean
+  /** Record that this profile accepted the Auto-review data disclosure. */
+  autoReviewDisclosureAcknowledged?: boolean
+  /** Let the hidden Codex reviewer answer eligible DSH approval requests. */
+  enableAutoReview?: boolean
   /** Model used for auxiliary standalone searches. */
   searchModel?: string
   /** Cached, indexed, or live web access. */
@@ -239,12 +264,19 @@ export interface Config {
 }
 
 export const Config: z<Config> = z.object({
+  oauthTimeoutMs: z.number().step(1).min(1_000).max(1_800_000).default(OPENAI_CODEX_AUTHORIZATION_TIMEOUT_MS),
   models: z.union([z.const(undefined), z.array(z.string())]),
   enableProxy: z.boolean().default(false),
   proxyUrl: z.string().default(DEFAULT_OPENAI_CODEX_PROXY_URL),
+  contextWindowOverrides: z.transform(
+    z.union([z.const(undefined), z.dict(z.union([z.const(null), z.number()]))]),
+    parseOpenAICodexContextWindowOverrides,
+  ),
   enableSearch: z.boolean().default(false),
   enableImageTool: z.boolean().default(false),
   enableImageGeneration: z.boolean().default(false),
+  autoReviewDisclosureAcknowledged: z.boolean().default(false),
+  enableAutoReview: z.boolean().default(false),
   searchModel: z.string().default(DEFAULT_OPENAI_CODEX_SEARCH_MODEL),
   searchMode: z.union(['cached', 'indexed', 'live'] as const).default(DEFAULT_OPENAI_CODEX_SEARCH_MODE),
   searchContextSize: z.union(['low', 'medium', 'high'] as const).default(DEFAULT_OPENAI_CODEX_SEARCH_CONTEXT_SIZE),
@@ -259,17 +291,31 @@ export const Config: z<Config> = z.object({
  * @param config - capability gates and standalone-search tuning.
  */
 export function apply(ctx: Context, config: Config): void {
+  const catalog = openAICodexModelCatalog()
+  const validateSettings = (value: Config): void => {
+    resolveOpenAICodexSettings(value)
+    assertOpenAICodexContextWindowOverrides(value.contextWindowOverrides ?? undefined, catalog)
+  }
+  validateSettings(config)
   let current = () => config
   const proxyManager = new OpenAICodexProxyManager()
   const resolveProviderProxyUrl = (): string | undefined => resolveOpenAICodexProxyUrl(resolveOpenAICodexSettings(current()))
   let proxyWasActive = resolveProviderProxyUrl() !== undefined
   const credentials = new OpenAICodexCredentialStore()
+  const imageAssets = new OpenAICodexImageAssetStore()
   const trustedOrigins = new OpenAICodexTrustedOriginsStore(
     join(dirname(credentials.filename), OPENAI_CODEX_TRUSTED_ORIGINS_FILENAME),
   )
   const fastMode = new FastModeRegistry()
   assertNoOpenAICodexProviderConflict(ctx.llm.listProviders().map(provider => provider.id))
   new OpenAICodexTransport(ctx, credentials, proxyManager, resolveProviderProxyUrl)
+  registerOpenAICodexAutoReview(
+    ctx,
+    credentials,
+    proxyManager,
+    resolveProviderProxyUrl,
+    () => resolveOpenAICodexSettings(current()).enableAutoReview,
+  )
   ctx.llm.registerAdapter(
     [OPENAI_CODEX_PROVIDER],
     createOpenAICodexAdapter(
@@ -279,13 +325,15 @@ export function apply(ctx: Context, config: Config): void {
       () => resolveOpenAICodexSettings(current()).models,
       proxyManager,
       resolveProviderProxyUrl,
+      () => resolveOpenAICodexSettings(current()).contextWindowOverrides,
     ),
   )
   ctx.inject(['webServer'], webCtx => {
-    registerOpenAICodexAuthRoutes(webCtx, credentials, trustedOrigins, fastMode, proxyManager, resolveProviderProxyUrl)
+    registerOpenAICodexAuthRoutes(webCtx, credentials, trustedOrigins, fastMode, proxyManager, resolveProviderProxyUrl, config.oauthTimeoutMs)
     registerOpenAICodexProxyRoutes(webCtx, trustedOrigins, proxyManager)
     registerOpenAICodexUpdateRoutes(webCtx, { currentVersion: CODEX_CONNECT_VERSION }, trustedOrigins)
     registerOpenAICodexModelCatalogRoute(webCtx, openAICodexModelCatalog, trustedOrigins)
+    registerOpenAICodexOriginalImageRoute(webCtx, trustedOrigins, imageAssets)
   })
 
   let stopped = false
@@ -314,16 +362,32 @@ export function apply(ctx: Context, config: Config): void {
     searchRegistration = undefined
     if (previous !== undefined) await previous.dispose()
     if (stopped || nextRegistration === undefined) return
-    const fiber = ctx.inject(['web'], webCtx => webCtx.web.registerSearchProvider(new OpenAICodexSearchProvider({
-      credentials,
-      model: nextRegistration.model,
-      mode: nextRegistration.mode,
-      contextSize: nextRegistration.contextSize,
-      maxOutputTokens: nextRegistration.maxOutputTokens,
-      resolveRequestId: () => String(webCtx.get('agents')?.currentInitiator()?.session.id ?? randomUUID()),
-      proxyManager,
-      resolveProxyUrl: resolveProviderProxyUrl,
-    })))
+    const fiber = ctx.inject(['web'], (webCtx) => {
+      const provider = new OpenAICodexSearchProvider({
+        credentials,
+        model: nextRegistration.model,
+        mode: nextRegistration.mode,
+        contextSize: nextRegistration.contextSize,
+        maxOutputTokens: nextRegistration.maxOutputTokens,
+        resolveRequestId: () => String(webCtx.get('agents')?.currentInitiator()?.session.id ?? randomUUID()),
+        proxyManager,
+        resolveProxyUrl: resolveProviderProxyUrl,
+      })
+      const unregister = webCtx.web.registerSearchProvider(provider)
+      try {
+        const restoreRoute = selectOpenAICodexSearchRoute(webCtx.web, provider.id)
+        return () => {
+          try {
+            restoreRoute()
+          } finally {
+            unregister()
+          }
+        }
+      } catch (error) {
+        unregister()
+        throw error
+      }
+    })
     searchFiber = fiber
     searchRegistration = nextRegistration
     void Promise.resolve(fiber).catch((error: unknown) => {
@@ -366,7 +430,7 @@ export function apply(ctx: Context, config: Config): void {
     if (stopped || !enabled) return
     const fiber = ctx.inject(
       ['tools', 'attachments'],
-      toolCtx => toolCtx.tools.register(imageGenerateTool(toolCtx)),
+      toolCtx => toolCtx.tools.register(imageGenerateTool(toolCtx, imageAssets)),
     )
     imageGenerationFiber = fiber
     void Promise.resolve(fiber).catch((error: unknown) => {
@@ -408,25 +472,27 @@ export function apply(ctx: Context, config: Config): void {
     await proxyManager.dispose()
   }, 'dsh-codex-connect: optional capability lifecycle')
 
-  installSettingsSection(ctx, OPENAI_CODEX_SETTINGS_NS, Config, config, {
-    validate(value) {
-      resolveOpenAICodexSettings(value)
-      if (value.enableProxy === true && !isValidOpenAICodexProxyUrl(value.proxyUrl)) {
-        throw new TypeError('OpenAI Codex proxyUrl must be an HTTP(S) origin without credentials or a path')
-      }
-    },
-    setSource(source) { current = source },
-    onChange() {
-      const proxyIsActive = resolveProviderProxyUrl() !== undefined
-      if (proxyWasActive && !proxyIsActive) {
-        void proxyManager.deactivate().catch((error: unknown) => {
-          ctx.logger.error('dsh-codex-connect: could not deactivate the provider proxy')
-          ctx.logger.error(error)
-        })
-      }
-      proxyWasActive = proxyIsActive
-      scheduleCapabilities()
-    },
+  ctx.inject(['settings'], (settingsCtx) => {
+    settingsCtx.settings.installSection(ctx, OPENAI_CODEX_SETTINGS_NS, Config, config, {
+      validate(value) {
+        validateSettings(value)
+        if (value.enableProxy === true && !isValidOpenAICodexProxyUrl(value.proxyUrl)) {
+          throw new TypeError('OpenAI Codex proxyUrl must be an HTTP(S) origin without credentials or a path')
+        }
+      },
+      setSource(source) { current = source },
+      onChange() {
+        const proxyIsActive = resolveProviderProxyUrl() !== undefined
+        if (proxyWasActive && !proxyIsActive) {
+          void proxyManager.deactivate().catch((error: unknown) => {
+            ctx.logger.error('dsh-codex-connect: could not deactivate the provider proxy')
+            ctx.logger.error(error)
+          })
+        }
+        proxyWasActive = proxyIsActive
+        scheduleCapabilities()
+      },
+    })
   })
   scheduleCapabilities()
 }

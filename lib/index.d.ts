@@ -1,13 +1,29 @@
 import z from "@deepseek-ai/schemastery";
-import { AuthInteraction, Credential, CredentialInfo, CredentialStore } from "@earendil-works/pi-ai";
+import { AuthInteraction, Credential, CredentialInfo, CredentialStore, OAuthCredential } from "@earendil-works/pi-ai";
 import "@deepseek-ai/dsh-tools";
 import { Context, Service } from "@deepseek-ai/cordis";
 import { WebSearchProvider, WebSearchRequest, WebSearchResult } from "@deepseek-ai/dsh-web";
+//#region src/account-profile.d.ts
+type OpenAICodexAccountProfileSource = 'oauth' | 'generated';
+//#endregion
 //#region src/store.d.ts
 /** Provider route and pi-ai provider id owned by this bundle. */
 declare const OPENAI_CODEX_PROVIDER = "openai-codex";
 /** Basename of the OAuth document inside the Harness home. */
 declare const OPENAI_CODEX_AUTH_FILENAME = ".openai-codex-auth.json";
+/** Maximum number of stored OpenAI Codex accounts. */
+declare const OPENAI_CODEX_ACCOUNT_LIMIT = 16;
+/** Maximum serialized credential document size. */
+declare const OPENAI_CODEX_AUTH_DOCUMENT_LIMIT: number;
+/** Suffix used for the one-time version-1 rollback copy. */
+declare const OPENAI_CODEX_AUTH_V1_BACKUP_SUFFIX = ".v1-backup";
+interface OpenAICodexAccountSummary {
+  accountKey: string;
+  displayName: string;
+  maskedEmail?: string;
+  profileSource: OpenAICodexAccountProfileSource;
+  active: boolean;
+}
 /**
  * Resolve the default OAuth document path.
  * @param dshHome - optional Harness-home override.
@@ -18,16 +34,35 @@ declare function openAICodexAuthPath(dshHome?: string): string;
 declare class OpenAICodexCredentialStore implements CredentialStore {
   /** Absolute credential document path. */
   readonly filename: string;
+  /** Owner-only version-1 rollback copy, created at the first migration write. */
+  readonly version1BackupFilename: string;
   /**
    * @param filename - explicit document path, defaulting under `$DSH_HOME`.
    */
   constructor(filename?: string);
   /** Read and validate the current document without acquiring the writer lock. */
-  private readCurrent;
+  private readDocument;
+  private readDocumentAt;
+  private writeDocument;
   /** @inheritdoc */
   read(providerId: string): Promise<Credential | undefined>;
+  /**
+   * Capture the current account for one request's complete auth resolution.
+   * Refreshes through the returned store update only that captured account and
+   * never change the user's current account selection.
+   */
+  captureActiveAccount(): Promise<CredentialStore>;
+  private modifyCapturedAccount;
   /** @inheritdoc */
   list(): Promise<readonly CredentialInfo[]>;
+  /** List browser-safe account summaries without exposing provider account ids. */
+  accounts(): Promise<readonly OpenAICodexAccountSummary[]>;
+  /** Resolve the account id stored with one exact access token. */
+  accountIdForAccess(access: string): Promise<string | undefined>;
+  /** Select a stored account using its browser-safe key. */
+  activate(selectedAccountKey: string): Promise<OAuthCredential>;
+  /** Remove one account; active removal requires an explicit stored replacement. */
+  removeAccount(selectedAccountKey: string, replacementAccountKey?: string): Promise<void>;
   /** @inheritdoc */
   modify(providerId: string, fn: (current: Credential | undefined) => Promise<Credential | undefined>): Promise<Credential | undefined>;
   /** @inheritdoc */
@@ -180,10 +215,10 @@ declare const IMAGE_GENERATE_TOOL_NAME = "codex_connect_image_generate";
 //#region src/compatibility.d.ts
 declare const COMPATIBILITY_SCHEMA_VERSION: 1;
 declare const SUPPORTED_NODE_RANGE = "^22.19.0 || >=24.0.0";
-declare const SUPPORTED_DSH_PLUGIN_API_VERSION = "0.1.1-rc.2";
-declare const SUPPORTED_PI_AI_VERSION = "0.82.1";
+declare const SUPPORTED_DSH_PLUGIN_API_VERSION = "0.1.2-rc.1";
+declare const SUPPORTED_PI_AI_RANGE = "^0.84.2";
 declare const PI_AI_PACKAGE = "@earendil-works/pi-ai";
-declare const DSH_PLUGIN_API_PACKAGES: readonly ["@deepseek-ai/dsh-agent", "@deepseek-ai/dsh-atomic-write", "@deepseek-ai/dsh-attachment", "@deepseek-ai/dsh-home-paths", "@deepseek-ai/dsh-host-webserver", "@deepseek-ai/dsh-invariants", "@deepseek-ai/dsh-llm", "@deepseek-ai/dsh-llm-pi-ai", "@deepseek-ai/dsh-fs", "@deepseek-ai/dsh-session", "@deepseek-ai/dsh-settings", "@deepseek-ai/dsh-tools", "@deepseek-ai/dsh-web"];
+declare const DSH_PLUGIN_API_PACKAGES: readonly ["@deepseek-ai/dsh-agent", "@deepseek-ai/dsh-atomic-write", "@deepseek-ai/dsh-attachment", "@deepseek-ai/dsh-home-paths", "@deepseek-ai/dsh-host-webserver", "@deepseek-ai/dsh-invariants", "@deepseek-ai/dsh-llm", "@deepseek-ai/dsh-llm-pi-ai", "@deepseek-ai/dsh-fs", "@deepseek-ai/dsh-session", "@deepseek-ai/dsh-settings", "@deepseek-ai/dsh-tools", "@deepseek-ai/dsh-util-values", "@deepseek-ai/dsh-web"];
 declare const COMPATIBILITY_PACKAGES: readonly ["@deepseek-ai/dsh-llm", "@deepseek-ai/dsh-llm-pi-ai", "@earendil-works/pi-ai"];
 type CompatibilityPackageName = (typeof COMPATIBILITY_PACKAGES)[number];
 type CompatibilityStatus = 'compatible' | 'incompatible' | 'unknown';
@@ -224,12 +259,12 @@ declare const COMPATIBILITY_CONTRACT: {
     readonly node: "^22.19.0 || >=24.0.0";
   };
   readonly dshPluginApi: {
-    readonly version: "0.1.1-rc.2";
-    readonly packages: readonly ["@deepseek-ai/dsh-agent", "@deepseek-ai/dsh-atomic-write", "@deepseek-ai/dsh-attachment", "@deepseek-ai/dsh-home-paths", "@deepseek-ai/dsh-host-webserver", "@deepseek-ai/dsh-invariants", "@deepseek-ai/dsh-llm", "@deepseek-ai/dsh-llm-pi-ai", "@deepseek-ai/dsh-fs", "@deepseek-ai/dsh-session", "@deepseek-ai/dsh-settings", "@deepseek-ai/dsh-tools", "@deepseek-ai/dsh-web"];
+    readonly version: "0.1.2-rc.1";
+    readonly packages: readonly ["@deepseek-ai/dsh-agent", "@deepseek-ai/dsh-atomic-write", "@deepseek-ai/dsh-attachment", "@deepseek-ai/dsh-home-paths", "@deepseek-ai/dsh-host-webserver", "@deepseek-ai/dsh-invariants", "@deepseek-ai/dsh-llm", "@deepseek-ai/dsh-llm-pi-ai", "@deepseek-ai/dsh-fs", "@deepseek-ai/dsh-session", "@deepseek-ai/dsh-settings", "@deepseek-ai/dsh-tools", "@deepseek-ai/dsh-util-values", "@deepseek-ai/dsh-web"];
   };
   readonly piAi: {
     readonly package: "@earendil-works/pi-ai";
-    readonly version: "0.82.1";
+    readonly version: "^0.84.2";
   };
 };
 /** Evaluate a captured set of versions without touching the filesystem. */
@@ -270,7 +305,7 @@ interface OpenAICodexDiagnosticReport {
     imageTool: boolean;
     imageGeneration: boolean;
     changesHarnessDefaultModel: false;
-    changesHarnessSearchRoute: false;
+    changesHarnessSearchRoute: boolean;
   };
   providerConflict: boolean;
   compatibility: CompatibilityReport;
@@ -360,6 +395,13 @@ declare function isValidOpenAICodexProxyUrl(value: unknown): value is string;
 type OpenAICodexSearchMode = 'cached' | 'indexed' | 'live';
 /** Search-context sizes accepted by the Codex standalone search endpoint. */
 type OpenAICodexSearchContextSize = 'low' | 'medium' | 'high';
+/**
+ * Whether a value is a bounded per-model context-window override map. Keys
+ * are nonempty, unpadded model ids; values are positive safe integers or null
+ * to restore that model's catalog default. The Host also checks catalog
+ * membership and the model-specific configuration ceiling.
+ */
+declare function isValidOpenAICodexContextWindowOverrides(value: unknown): value is Readonly<Record<string, number | null>>;
 /** Default model used by the standalone search endpoint. */
 declare const DEFAULT_OPENAI_CODEX_SEARCH_MODEL = "gpt-5.6-sol";
 /** Default search mode, matching the official local Codex client. */
@@ -376,19 +418,34 @@ interface OpenAICodexSettingsConfig {
   enableProxy: boolean;
   /** Credential-free HTTP(S) proxy origin; inactive while enableProxy is false. */
   proxyUrl: string;
+  /**
+   * Per-model context-window overrides keyed by catalog model id. Each value
+   * replaces the advertised `contextWindow` for that model inside the adapter
+   * profile for client budgeting. It does not change or verify server capacity,
+   * output-token limits, or the deployment's compaction policy.
+   */
+  contextWindowOverrides: Readonly<Record<string, number>> | undefined;
   enableSearch: boolean;
   enableImageTool: boolean;
   enableImageGeneration: boolean;
+  /** Whether this profile accepted the Auto-review data disclosure. */
+  autoReviewDisclosureAcknowledged: boolean;
+  /** Let the hidden Codex reviewer answer eligible DSH approval requests. */
+  enableAutoReview: boolean;
   searchModel: string;
   searchMode: OpenAICodexSearchMode;
   searchContextSize: OpenAICodexSearchContextSize;
   searchMaxOutputTokens: number;
 }
 declare const DEFAULT_OPENAI_CODEX_SETTINGS: Readonly<OpenAICodexSettingsConfig>;
+/** Input settings allow null to disable overrides inherited from a lower settings layer. */
+interface OpenAICodexSettingsInput extends Partial<Omit<OpenAICodexSettingsConfig, 'contextWindowOverrides'>> {
+  contextWindowOverrides?: Readonly<Record<string, number | null>> | null | undefined;
+}
 /** Fill the schema defaults even when called without Cordis validation. */
-declare function resolveOpenAICodexSettings(value: Partial<OpenAICodexSettingsConfig>): OpenAICodexSettingsConfig;
+declare function resolveOpenAICodexSettings(value: OpenAICodexSettingsInput): OpenAICodexSettingsConfig;
 /** Resolve the active proxy without treating a disabled value as a route. */
-declare function resolveOpenAICodexProxyUrl(value: Partial<OpenAICodexSettingsConfig>): string | undefined;
+declare function resolveOpenAICodexProxyUrl(value: OpenAICodexSettingsInput): string | undefined;
 /** Narrow the redacted settings wire payload before it enters React state. */
 declare function decodeOpenAICodexSettings(value: unknown): OpenAICodexSettingsConfig | undefined;
 //#endregion
@@ -555,16 +612,18 @@ declare const OPENAI_CODEX_FAST_MODE_PATH = "/plugins/dsh-openai-codex/fast-mode
 declare const OPENAI_CODEX_UPDATE_PATH = "/openai-codex/update";
 //#endregion
 //#region src/update.d.ts
-type OpenAICodexUpdateHighlightKind = 'trusted-origins' | 'runtime-compatibility' | 'quota-fast-mode' | 'dsh-rc7' | 'search-stability' | 'image-generation' | 'oauth-history' | 'model-visibility' | 'proxy-connection';
+type OpenAICodexUpdateHighlightKind = 'trusted-origins' | 'runtime-compatibility' | 'quota-fast-mode' | 'dsh-rc7' | 'search-stability' | 'image-generation' | 'oauth-history' | 'model-visibility' | 'proxy-connection' | 'models-account' | 'context-budget' | 'auto-review-probe' | 'auto-review' | 'astra-compatibility' | 'multi-account' | 'search-route';
 interface OpenAICodexUpdateHighlight {
   version: string;
   kind: OpenAICodexUpdateHighlightKind;
 }
-type OpenAICodexDshCompatibilityStatus = 'compatible' | 'plugin-update-required' | 'not-yet-compatible' | 'unverified';
+type OpenAICodexDshCompatibilityStatus = 'compatible' | 'plugin-update-required' | 'dsh-update-required' | 'not-yet-compatible' | 'unverified';
 interface OpenAICodexDshCompatibilityAdvice {
   status: OpenAICodexDshCompatibilityStatus;
   latestPluginVersion: string;
   latestDshVersion?: string;
+  reportCompatibilityGap?: true;
+  trackerUrl?: string;
 }
 type OpenAICodexUpdateResult = {
   status: 'up-to-date';
@@ -659,21 +718,35 @@ declare const name = "llm-openai-codex";
 /** The model registry required before the provider can register. */
 declare const inject: string[];
 /** Branded Host settings namespace for Codex Connect capability configuration. */
-declare const OPENAI_CODEX_SETTINGS_NS: import("@deepseek-ai/dsh-settings").SettingsNamespace;
+declare const OPENAI_CODEX_SETTINGS_NS = "llm-openai-codex";
 /** Composite model and standalone-search configuration. */
 interface Config {
+  /** Complete interactive OAuth deadline in milliseconds; applies when the plugin loads. */
+  oauthTimeoutMs?: number;
   /** Model ids advertised in selectors; omitted to advertise the full catalog. */
   models?: string[] | undefined;
   /** Route Codex Connect requests through proxyUrl after explicit activation. */
   enableProxy?: boolean;
   /** Credential-free HTTP(S) proxy origin. */
   proxyUrl?: string;
+  /**
+   * Per-model context-window overrides keyed by catalog model id. Each value
+   * replaces the advertised `contextWindow` for that model inside the adapter
+   * profile for client budgeting. It does not change or verify server capacity,
+   * output-token limits, or the deployment's compaction policy.
+   * Whole-map or per-model null disables inherited overrides; omitted keys inherit lower layers.
+   */
+  contextWindowOverrides?: Record<string, number | null> | null | undefined;
   /** Register the optional standalone Codex search provider. */
   enableSearch?: boolean;
   /** Register the optional image-loading tool. */
   enableImageTool?: boolean;
   /** Register the optional prompt-only image generation tool. */
   enableImageGeneration?: boolean;
+  /** Record that this profile accepted the Auto-review data disclosure. */
+  autoReviewDisclosureAcknowledged?: boolean;
+  /** Let the hidden Codex reviewer answer eligible DSH approval requests. */
+  enableAutoReview?: boolean;
   /** Model used for auxiliary standalone searches. */
   searchModel?: string;
   /** Cached, indexed, or live web access. */
@@ -693,4 +766,4 @@ declare const Config: z<Config>;
  */
 declare function apply(ctx: Context, config: Config): void;
 //#endregion
-export { COMPATIBILITY_CONTRACT, COMPATIBILITY_PACKAGES, COMPATIBILITY_SCHEMA_VERSION, type CompatibilityDetectionOptions, type CompatibilityEntry, type CompatibilityEvaluationInput, type CompatibilityPackageName, type CompatibilityReport, type CompatibilityStatus, Config, DEFAULT_OPENAI_CODEX_PROXY_URL, DEFAULT_OPENAI_CODEX_SEARCH_CONTEXT_SIZE, DEFAULT_OPENAI_CODEX_SEARCH_MAX_OUTPUT_TOKENS, DEFAULT_OPENAI_CODEX_SEARCH_MODE, DEFAULT_OPENAI_CODEX_SEARCH_MODEL, DEFAULT_OPENAI_CODEX_SETTINGS, DSH_PLUGIN_API_PACKAGES, FastModeRegistry, FastModeRegistry as OpenAICodexFastModeRegistry, type GeneratedImagePayload, IMAGE_GENERATE_TOOL_NAME, type ImageGenerationRequest, type ImageGenerationResponse, type ImageRequestContext, OPENAI_CODEX_AUTH_FILENAME, OPENAI_CODEX_BASE_URL, OPENAI_CODEX_FAST_MODE_MAX_SESSIONS, OPENAI_CODEX_FAST_MODE_MAX_SESSION_ID_LENGTH, OPENAI_CODEX_FAST_MODE_PATH, OPENAI_CODEX_HISTORY_BACKUP_SUFFIX, OPENAI_CODEX_IMAGE_GENERATION_URL, OPENAI_CODEX_IMAGE_MAX_COUNT, OPENAI_CODEX_IMAGE_MAX_ERROR_BYTES, OPENAI_CODEX_IMAGE_MAX_RESPONSE_BYTES, OPENAI_CODEX_IMAGE_PROMPT_MAX_LENGTH, OPENAI_CODEX_IMAGE_REQUEST_TIMEOUT_MS, OPENAI_CODEX_LOCAL_PROXY_CANDIDATES, OPENAI_CODEX_PROVIDER, OPENAI_CODEX_PROXY_CANDIDATE_LIMIT, OPENAI_CODEX_PROXY_DETECT_PATH, OPENAI_CODEX_PROXY_PROBE_TIMEOUT_MS, OPENAI_CODEX_PROXY_PROBE_URL, OPENAI_CODEX_PROXY_TEST_PATH, OPENAI_CODEX_SEARCH_MODEL_REQUEST_EVENT, OPENAI_CODEX_SEARCH_PROVIDER, OPENAI_CODEX_SEARCH_URL, OPENAI_CODEX_SETTINGS_NAMESPACE, OPENAI_CODEX_SETTINGS_NS, OPENAI_CODEX_TRANSPORT_API_VERSION, OPENAI_CODEX_TRANSPORT_ERROR_CODES, OPENAI_CODEX_TRANSPORT_SERVICE, OPENAI_CODEX_UPDATE_PATH, OPENAI_CODEX_USAGE_URL, type OpenAICodexAuthStatus, OpenAICodexCredentialStore, type OpenAICodexCredits, type OpenAICodexDiagnosticOptions, type OpenAICodexDiagnosticReport, type OpenAICodexHistoryMigrationFile, type OpenAICodexHistoryMigrationOptions, type OpenAICodexHistoryMigrationResult, type OpenAICodexIndividualLimit, OpenAICodexProxyManager, type OpenAICodexProxyProbeClassification, type OpenAICodexProxyProbeResult, type OpenAICodexRateLimit, type OpenAICodexRateLimitWindow, type OpenAICodexSearchContextSize, type OpenAICodexSearchMode, OpenAICodexSearchProvider, type OpenAICodexSearchProviderOptions, type OpenAICodexSearchRequestRecord, type OpenAICodexSettingsConfig, OpenAICodexTransport, OpenAICodexTransportError, type OpenAICodexTransportErrorCode, type OpenAICodexTransportV1, type OpenAICodexUpdateResult, type OpenAICodexUsage, PI_AI_PACKAGE, SUPPORTED_DSH_PLUGIN_API_VERSION, SUPPORTED_NODE_RANGE, SUPPORTED_PI_AI_VERSION, VIEW_IMAGE_TOOL_NAME, apply, assertNoOpenAICodexProviderConflict, assessCompatibility, checkForOpenAICodexUpdate, compareOpenAICodexVersions, decodeOpenAICodexSettings, detectCompatibility, detectOpenAICodexProxies, diagnoseOpenAICodex, evaluateCompatibility, inject, isFastModeSessionId, isOpenAICodexTransportError, isValidOpenAICodexProxyUrl, listOpenAICodexProxyCandidates, loginOpenAICodex, logoutOpenAICodex, mapOpenAICodexSearchResponse, migrateOpenAICodexSearchHistory, name, openAICodexAuthPath, openAICodexAuthStatus, openAICodexConflictMessage, parseOpenAICodexUpdateResult, parseOpenAICodexUsage, parseOpenAICodexVersion, readOpenAICodexRateLimits, resolveOpenAICodexProxyUrl, resolveOpenAICodexSettings };
+export { COMPATIBILITY_CONTRACT, COMPATIBILITY_PACKAGES, COMPATIBILITY_SCHEMA_VERSION, type CompatibilityDetectionOptions, type CompatibilityEntry, type CompatibilityEvaluationInput, type CompatibilityPackageName, type CompatibilityReport, type CompatibilityStatus, Config, DEFAULT_OPENAI_CODEX_PROXY_URL, DEFAULT_OPENAI_CODEX_SEARCH_CONTEXT_SIZE, DEFAULT_OPENAI_CODEX_SEARCH_MAX_OUTPUT_TOKENS, DEFAULT_OPENAI_CODEX_SEARCH_MODE, DEFAULT_OPENAI_CODEX_SEARCH_MODEL, DEFAULT_OPENAI_CODEX_SETTINGS, DSH_PLUGIN_API_PACKAGES, FastModeRegistry, FastModeRegistry as OpenAICodexFastModeRegistry, type GeneratedImagePayload, IMAGE_GENERATE_TOOL_NAME, type ImageGenerationRequest, type ImageGenerationResponse, type ImageRequestContext, OPENAI_CODEX_ACCOUNT_LIMIT, OPENAI_CODEX_AUTH_DOCUMENT_LIMIT, OPENAI_CODEX_AUTH_FILENAME, OPENAI_CODEX_AUTH_V1_BACKUP_SUFFIX, OPENAI_CODEX_BASE_URL, OPENAI_CODEX_FAST_MODE_MAX_SESSIONS, OPENAI_CODEX_FAST_MODE_MAX_SESSION_ID_LENGTH, OPENAI_CODEX_FAST_MODE_PATH, OPENAI_CODEX_HISTORY_BACKUP_SUFFIX, OPENAI_CODEX_IMAGE_GENERATION_URL, OPENAI_CODEX_IMAGE_MAX_COUNT, OPENAI_CODEX_IMAGE_MAX_ERROR_BYTES, OPENAI_CODEX_IMAGE_MAX_RESPONSE_BYTES, OPENAI_CODEX_IMAGE_PROMPT_MAX_LENGTH, OPENAI_CODEX_IMAGE_REQUEST_TIMEOUT_MS, OPENAI_CODEX_LOCAL_PROXY_CANDIDATES, OPENAI_CODEX_PROVIDER, OPENAI_CODEX_PROXY_CANDIDATE_LIMIT, OPENAI_CODEX_PROXY_DETECT_PATH, OPENAI_CODEX_PROXY_PROBE_TIMEOUT_MS, OPENAI_CODEX_PROXY_PROBE_URL, OPENAI_CODEX_PROXY_TEST_PATH, OPENAI_CODEX_SEARCH_MODEL_REQUEST_EVENT, OPENAI_CODEX_SEARCH_PROVIDER, OPENAI_CODEX_SEARCH_URL, OPENAI_CODEX_SETTINGS_NAMESPACE, OPENAI_CODEX_SETTINGS_NS, OPENAI_CODEX_TRANSPORT_API_VERSION, OPENAI_CODEX_TRANSPORT_ERROR_CODES, OPENAI_CODEX_TRANSPORT_SERVICE, OPENAI_CODEX_UPDATE_PATH, OPENAI_CODEX_USAGE_URL, type OpenAICodexAccountSummary, type OpenAICodexAuthStatus, OpenAICodexCredentialStore, type OpenAICodexCredits, type OpenAICodexDiagnosticOptions, type OpenAICodexDiagnosticReport, type OpenAICodexHistoryMigrationFile, type OpenAICodexHistoryMigrationOptions, type OpenAICodexHistoryMigrationResult, type OpenAICodexIndividualLimit, OpenAICodexProxyManager, type OpenAICodexProxyProbeClassification, type OpenAICodexProxyProbeResult, type OpenAICodexRateLimit, type OpenAICodexRateLimitWindow, type OpenAICodexSearchContextSize, type OpenAICodexSearchMode, OpenAICodexSearchProvider, type OpenAICodexSearchProviderOptions, type OpenAICodexSearchRequestRecord, type OpenAICodexSettingsConfig, OpenAICodexTransport, OpenAICodexTransportError, type OpenAICodexTransportErrorCode, type OpenAICodexTransportV1, type OpenAICodexUpdateResult, type OpenAICodexUsage, PI_AI_PACKAGE, SUPPORTED_DSH_PLUGIN_API_VERSION, SUPPORTED_NODE_RANGE, SUPPORTED_PI_AI_RANGE, VIEW_IMAGE_TOOL_NAME, apply, assertNoOpenAICodexProviderConflict, assessCompatibility, checkForOpenAICodexUpdate, compareOpenAICodexVersions, decodeOpenAICodexSettings, detectCompatibility, detectOpenAICodexProxies, diagnoseOpenAICodex, evaluateCompatibility, inject, isFastModeSessionId, isOpenAICodexTransportError, isValidOpenAICodexContextWindowOverrides, isValidOpenAICodexProxyUrl, listOpenAICodexProxyCandidates, loginOpenAICodex, logoutOpenAICodex, mapOpenAICodexSearchResponse, migrateOpenAICodexSearchHistory, name, openAICodexAuthPath, openAICodexAuthStatus, openAICodexConflictMessage, parseOpenAICodexUpdateResult, parseOpenAICodexUsage, parseOpenAICodexVersion, readOpenAICodexRateLimits, resolveOpenAICodexProxyUrl, resolveOpenAICodexSettings };
